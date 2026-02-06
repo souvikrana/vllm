@@ -1,0 +1,95 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                                                                            ║
+║              vLLM Scheduler Performance Analysis - Quick Start            ║
+║                                                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📦 WHAT WAS ADDED:
+
+  ✓ Detailed timing instrumentation in scheduler
+  ✓ Benchmark script with realistic traffic patterns
+  ✓ Helper scripts and documentation
+  ✓ Result interpretation guides
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 GETTING STARTED (3 steps):
+
+  Terminal 1:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ cd /home/souvik/repos/vllm                                              │
+  │ ./run_scheduler_benchmark.sh --build          # 10-20 min              │
+  │ ./run_scheduler_benchmark.sh --serve          # Keep running           │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Terminal 2:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ cd /home/souvik/repos/vllm                                              │
+  │ ./run_scheduler_benchmark.sh --benchmark --scenario heavy              │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 WHAT TO LOOK FOR:
+
+  In Server Logs (Terminal 1):
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ SCHEDULER TIMING ANALYSIS (every 100 calls)                            │
+  │   - Total schedule() time: _____ ms/call                                │
+  │   - Status checks: _____ ms (____%)  ← HIGH? Need readiness cache!     │
+  │   - Prefix cache: _____ ms (____%)   ← HIGH? Cache lookups!            │
+  │   - Wasted checks: _____ reqs/call   ← HIGH? Blocking issue!           │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  In Benchmark Output (Terminal 2):
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ Time to First Token (TTFT):                                             │
+  │   - Mean: _____ ms          ← Lower is better                           │
+  │   - p99:  _____ ms          ← Should be < 3x mean                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 QUICK DIAGNOSIS:
+
+  ✗ Status checks > 40% of waiting time?
+    → Implement readiness cache (30-40% improvement)
+
+  ✗ Prefix cache lookups > 35% of waiting time?
+    → Cache prefix lookups on Request (15-25% improvement)
+
+  ✗ Wasted checks > 30% of checked requests?
+    → Queue has many blocked requests, cache critical!
+
+  ✗ Total schedule() time > 3ms?
+    → Multiple bottlenecks, comprehensive optimization needed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📚 DOCUMENTATION:
+
+  SCHEDULER_OPTIMIZATION_SUMMARY.md  → Complete overview
+  RUN_BENCHMARK.md                   → Build and run instructions
+  INTERPRET_RESULTS.md               → Understanding timing data
+
+  Detailed optimization solutions    → See previous conversation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚙️  ADVANCED OPTIONS:
+
+  # Use different model
+  ./run_scheduler_benchmark.sh --serve --model meta-llama/Llama-3.2-3B
+
+  # Run all scenarios
+  ./run_scheduler_benchmark.sh --benchmark --scenario burst
+  python benchmark_scheduler.py --all-scenarios
+
+  # Custom benchmark
+  python benchmark_scheduler.py --scenario heavy --url http://localhost:8000
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 TIP: Run "heavy" or "burst" scenarios to see the biggest bottlenecks!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

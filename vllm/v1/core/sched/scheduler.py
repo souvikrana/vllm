@@ -60,6 +60,111 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+# ============================================================================
+# PERFORMANCE INSTRUMENTATION - Added for scheduler optimization analysis
+# ============================================================================
+class SchedulerTimingStats:
+    """Collects detailed timing statistics for scheduler operations."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all counters and timing stats."""
+        # Timing accumulators (in seconds)
+        self.total_schedule_time = 0.0
+        self.running_reqs_time = 0.0
+        self.waiting_reqs_time = 0.0
+        self.waiting_loop_overhead = 0.0
+
+        # Waiting queue breakdown
+        self.status_check_time = 0.0  # Time checking request status
+        self.remote_kv_check_time = 0.0  # Time checking WAITING_FOR_REMOTE_KVS
+        self.fsm_check_time = 0.0  # Time checking WAITING_FOR_FSM
+        self.streaming_check_time = 0.0  # Time checking WAITING_FOR_STREAMING_REQ
+        self.lora_check_time = 0.0  # Time checking LoRA constraints
+        self.prefix_cache_time = 0.0  # Time doing prefix cache lookups
+        self.kv_allocation_time = 0.0  # Time allocating KV cache
+
+        # Counters
+        self.schedule_calls = 0
+        self.running_reqs_checked = 0
+        self.waiting_reqs_checked = 0
+        self.waiting_reqs_scheduled = 0
+        self.waiting_reqs_skipped_remote_kv = 0
+        self.waiting_reqs_skipped_fsm = 0
+        self.waiting_reqs_skipped_streaming = 0
+        self.waiting_reqs_skipped_lora = 0
+        self.prefix_cache_lookups = 0
+        self.kv_allocations = 0
+
+    def log_summary(self):
+        """Log a summary of timing statistics."""
+        if self.schedule_calls == 0:
+            return
+
+        avg_schedule = self.total_schedule_time / self.schedule_calls * 1000
+        avg_waiting = self.waiting_reqs_time / self.schedule_calls * 1000
+
+        logger.info("=" * 80)
+        logger.info("SCHEDULER TIMING ANALYSIS (averaged over %d schedule() calls)",
+                   self.schedule_calls)
+        logger.info("=" * 80)
+        logger.info("Total schedule() time:        %.3f ms/call", avg_schedule)
+        logger.info("  - Running reqs processing:  %.3f ms  (%.1f%%)",
+                   self.running_reqs_time / self.schedule_calls * 1000,
+                   100 * self.running_reqs_time / self.total_schedule_time if self.total_schedule_time > 0 else 0)
+        logger.info("  - Waiting reqs processing:  %.3f ms  (%.1f%%)",
+                   avg_waiting,
+                   100 * self.waiting_reqs_time / self.total_schedule_time if self.total_schedule_time > 0 else 0)
+        logger.info("")
+        logger.info("Waiting queue breakdown:")
+        logger.info("  - Status checks:            %.3f ms  (%.1f%% of waiting time)",
+                   self.status_check_time / self.schedule_calls * 1000,
+                   100 * self.status_check_time / self.waiting_reqs_time if self.waiting_reqs_time > 0 else 0)
+        logger.info("    ∟ Remote KV checks:       %.3f ms  (%d reqs skipped)",
+                   self.remote_kv_check_time / self.schedule_calls * 1000,
+                   self.waiting_reqs_skipped_remote_kv)
+        logger.info("    ∟ FSM checks:             %.3f ms  (%d reqs skipped)",
+                   self.fsm_check_time / self.schedule_calls * 1000,
+                   self.waiting_reqs_skipped_fsm)
+        logger.info("    ∟ Streaming checks:       %.3f ms  (%d reqs skipped)",
+                   self.streaming_check_time / self.schedule_calls * 1000,
+                   self.waiting_reqs_skipped_streaming)
+        logger.info("    ∟ LoRA checks:            %.3f ms  (%d reqs skipped)",
+                   self.lora_check_time / self.schedule_calls * 1000,
+                   self.waiting_reqs_skipped_lora)
+        logger.info("  - Prefix cache lookups:     %.3f ms  (%.1f%%, %d lookups)",
+                   self.prefix_cache_time / self.schedule_calls * 1000,
+                   100 * self.prefix_cache_time / self.waiting_reqs_time if self.waiting_reqs_time > 0 else 0,
+                   self.prefix_cache_lookups)
+        logger.info("  - KV cache allocations:     %.3f ms  (%.1f%%, %d allocs)",
+                   self.kv_allocation_time / self.schedule_calls * 1000,
+                   100 * self.kv_allocation_time / self.waiting_reqs_time if self.waiting_reqs_time > 0 else 0,
+                   self.kv_allocations)
+        logger.info("")
+        logger.info("Request processing:")
+        logger.info("  - Avg waiting reqs checked: %.1f reqs/call",
+                   self.waiting_reqs_checked / self.schedule_calls)
+        logger.info("  - Avg waiting reqs scheduled: %.1f reqs/call",
+                   self.waiting_reqs_scheduled / self.schedule_calls)
+        logger.info("  - Wasted checks (blocked):  %.1f reqs/call",
+                   (self.waiting_reqs_skipped_remote_kv +
+                    self.waiting_reqs_skipped_fsm +
+                    self.waiting_reqs_skipped_streaming +
+                    self.waiting_reqs_skipped_lora) / self.schedule_calls)
+        logger.info("=" * 80)
+
+
+# Global timing stats instance
+_scheduler_timing_stats = SchedulerTimingStats()
+
+
+def get_scheduler_timing_stats() -> SchedulerTimingStats:
+    """Get the global scheduler timing stats instance."""
+    return _scheduler_timing_stats
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -330,6 +435,11 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # TIMING: Start overall schedule timing
+        _schedule_start_time = time.perf_counter()
+        _timing_stats = get_scheduler_timing_stats()
+        _timing_stats.schedule_calls += 1
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -348,6 +458,8 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         # First, schedule the RUNNING requests.
+        # TIMING: Track running requests processing
+        _running_start_time = time.perf_counter()
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -529,9 +641,17 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        # TIMING: End running requests, start waiting requests
+        _running_end_time = time.perf_counter()
+        _timing_stats.running_reqs_time += (_running_end_time - _running_start_time)
+        _timing_stats.running_reqs_checked += req_index
+
         # Next, schedule the WAITING requests.
+        _waiting_start_time = time.perf_counter()
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                # TIMING: Track each waiting request checked
+                _timing_stats.waiting_reqs_checked += 1
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -539,8 +659,11 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
 
                 # KVTransfer: skip request if still waiting for remote kvs.
+                # TIMING: Track remote KV check time
+                _check_start = time.perf_counter()
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
+                    _timing_stats.remote_kv_check_time += (time.perf_counter() - _check_start)
                     if is_ready:
                         if request.num_preemptions:
                             # We must be loading for a resumed preemption
@@ -553,23 +676,32 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                        _timing_stats.waiting_reqs_skipped_remote_kv += 1
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
+                # TIMING: Track FSM check time
+                _check_start = time.perf_counter()
                 if request.status == RequestStatus.WAITING_FOR_FSM:
+                    _timing_stats.fsm_check_time += (time.perf_counter() - _check_start)
                     structured_output_req = request.structured_output_request
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
+                        _timing_stats.waiting_reqs_skipped_fsm += 1
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
                 # Streaming: skip request if still waiting for next streaming req.
+                # TIMING: Track streaming check time
+                _check_start = time.perf_counter()
                 if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    _timing_stats.streaming_check_time += (time.perf_counter() - _check_start)
+                    _timing_stats.waiting_reqs_skipped_streaming += 1
                     assert not request.streaming_queue
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -577,6 +709,8 @@ class Scheduler(SchedulerInterface):
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
+                # TIMING: Track LoRA check time
+                _check_start = time.perf_counter()
                 if (
                     self.lora_config
                     and request.lora_request
@@ -585,10 +719,13 @@ class Scheduler(SchedulerInterface):
                         and request.lora_request.lora_int_id not in scheduled_loras
                     )
                 ):
+                    _timing_stats.lora_check_time += (time.perf_counter() - _check_start)
+                    _timing_stats.waiting_reqs_skipped_lora += 1
                     # Scheduling would exceed max_loras, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
+                _timing_stats.lora_check_time += (time.perf_counter() - _check_start)
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -596,10 +733,14 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    # TIMING: Track prefix cache lookup time
+                    _prefix_start = time.perf_counter()
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    _timing_stats.prefix_cache_time += (time.perf_counter() - _prefix_start)
+                    _timing_stats.prefix_cache_lookups += 1
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -710,6 +851,8 @@ class Scheduler(SchedulerInterface):
                     else 0
                 )
 
+                # TIMING: Track KV cache allocation time
+                _alloc_start = time.perf_counter()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -720,6 +863,8 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
+                _timing_stats.kv_allocation_time += (time.perf_counter() - _alloc_start)
+                _timing_stats.kv_allocations += 1
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -761,6 +906,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                # TIMING: Count successfully scheduled waiting request
+                _timing_stats.waiting_reqs_scheduled += 1
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -893,6 +1040,16 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # TIMING: End waiting requests and total schedule timing
+        _waiting_end_time = time.perf_counter()
+        _timing_stats.waiting_reqs_time += (_waiting_end_time - _waiting_start_time)
+        _timing_stats.total_schedule_time += (time.perf_counter() - _schedule_start_time)
+
+        # Log timing stats every 100 calls
+        if _timing_stats.schedule_calls % 100 == 0:
+            _timing_stats.log_summary()
+
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
